@@ -92,7 +92,23 @@ async function startMcpServer(serverName: string, config: McpServerEntry) {
     return;
   }
 
-  const transportType = config.type || 'stdio';
+  // [pin] §4.A layer 1: stdio fully disabled in this deployment
+  // (bmen MCP audit 2026-05-27 — reject missing `type` AND explicit `stdio`)
+  const transportType = config.type;
+  if (!transportType) {
+    throw new McpError(
+      ErrorCode.InvalidRequest,
+      `Server "${serverName}" config is missing required field "type". ` +
+      `Use "sse" or "streamableHttp" (stdio disabled in this deployment).`,
+    );
+  }
+  if (transportType === 'stdio') {
+    throw new McpError(
+      ErrorCode.InvalidRequest,
+      `Server "${serverName}" uses stdio transport which is disabled in this deployment. ` +
+      `Use "sse" or "streamableHttp".`,
+    );
+  }
 
   if (transportType === 'stdio') {
     const env = { ...process.env, ...config.env } as Record<string, string>;
@@ -264,14 +280,20 @@ export async function mcpInit(router: Router): Promise<void> {
       }
 
       // Validate based on transport type
-      const transportType = config.type || 'stdio';
+      // [pin] §4.A layer 2: stdio fully disabled at API entry
+      // (bmen MCP audit 2026-05-27 — reject missing `type` AND explicit `stdio` with 400)
+      const transportType = config.type;
+      if (!transportType) {
+        return response.status(400).json({
+          error: 'Server config is missing required field "type". Use "sse" or "streamableHttp" (stdio disabled in this deployment).',
+        });
+      }
       if (transportType === 'stdio') {
-        if (!config.command || typeof config.command !== 'string') {
-          return response.status(400).json({
-            error: 'Server command is required for stdio transport',
-          });
-        }
-      } else if (transportType === 'streamableHttp' || transportType === 'sse') {
+        return response.status(400).json({
+          error: 'stdio transport disabled in this deployment. Use "sse" or "streamableHttp".',
+        });
+      }
+      if (transportType === 'streamableHttp' || transportType === 'sse') {
         if (!config.url || typeof config.url !== 'string') {
           return response.status(400).json({
             error: `Server URL is required for ${transportType} transport`,
