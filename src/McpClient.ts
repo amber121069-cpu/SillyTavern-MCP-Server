@@ -6,6 +6,12 @@ import { EventSource } from 'eventsource';
 const JSONRPC_VERSION = '2.0';
 const PROTOCOL_VERSION = '2025-06-18';
 
+// [x2] TE17 (D-209): time limits of the streamable HTTP transport, kept in one place.
+// CONNECT_TIMEOUT_MS covers connect(): the initialize request, its reply and the initialized notification.
+// REQUEST_TIMEOUT_MS covers one request (tools/list, tools/call) from sending it to its response.
+export const CONNECT_TIMEOUT_MS = 30_000;
+export const REQUEST_TIMEOUT_MS = 120_000;
+
 export enum ErrorCode {
   // SDK error codes
   ConnectionClosed = -32000,
@@ -342,6 +348,12 @@ export class McpClient {
       return this.initializePromise;
     } else if (this.transport === 'streamableHttp') {
       this.initializePromise = new Promise(async (resolve, reject) => {
+        // [x2] TE17: one time limit for the whole connect; the timer rejects even if a read ignores the abort
+        const controller = new AbortController();
+        const timer = setTimeout(() => {
+          reject(new McpError(ErrorCode.RequestTimeout, `connect timed out after ${CONNECT_TIMEOUT_MS} ms`));
+          controller.abort();
+        }, CONNECT_TIMEOUT_MS);
         try {
           // POST initialize
           const headers: any = {
@@ -366,6 +378,7 @@ export class McpClient {
                 clientInfo: this.clientInfo,
               },
             }),
+            signal: controller.signal,
           });
           if (!res.ok) {
             const errorText = await res.text();
@@ -409,10 +422,12 @@ export class McpClient {
           this.isConnected = true;
           this.negotiatedProtocolVersion = result.result?.protocolVersion || PROTOCOL_VERSION;
           // Send initialized notification
-          await this.sendNotification('notifications/initialized');
+          await this.sendNotification('notifications/initialized', undefined, controller.signal);
           resolve();
         } catch (err) {
           reject(err);
+        } finally {
+          clearTimeout(timer); // [x2] TE17
         }
       });
       return this.initializePromise;
@@ -554,8 +569,14 @@ export class McpClient {
         };
         // [x2] TE17 (D-209): every way out of this request settles it once and removes it from pendingRequests
         let settled = false;
+        const controller = new AbortController();
+        const timer = setTimeout(() => {
+          fail(new McpError(ErrorCode.RequestTimeout, `${method} timed out after ${REQUEST_TIMEOUT_MS} ms`));
+          controller.abort();
+        }, REQUEST_TIMEOUT_MS);
         const settle = () => {
           settled = true;
+          clearTimeout(timer);
           this.pendingRequests.delete(id);
         };
         const succeed = (value: unknown) => {
@@ -586,6 +607,7 @@ export class McpClient {
             method: 'POST',
             headers,
             body: JSON.stringify(request),
+            signal: controller.signal,
           });
         } catch (err) {
           fail(new McpError(ErrorCode.ConnectionClosed, 'Network error: ' + (err as Error).message));
@@ -680,7 +702,7 @@ export class McpClient {
     }
   }
 
-  private async sendNotification(method: string, params?: any): Promise<void> {
+  private async sendNotification(method: string, params?: any, signal?: AbortSignal): Promise<void> {
     if (!this.isConnected) {
       throw new McpError(ErrorCode.ConnectionClosed, 'MCP client is not connected');
     }
@@ -714,6 +736,7 @@ export class McpClient {
         method: 'POST',
         headers,
         body: JSON.stringify(notification),
+        signal, // [x2] TE17: the connect time limit
       });
     }
   }
