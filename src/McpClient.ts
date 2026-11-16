@@ -121,6 +121,37 @@ export class McpError extends Error {
   }
 }
 
+// [x2] TE17 (D-209): the JSON-RPC messages in a reply body, whether it is one JSON value or SSE `data:` lines;
+// anything that is not a JSON object is skipped
+function parseMessages(text: string): any[] {
+  const parse = (value: string) => {
+    try {
+      return JSON.parse(value);
+    } catch (e) {
+      return undefined;
+    }
+  };
+  const whole = parse(text);
+  const found =
+    whole !== undefined
+      ? [whole]
+      : text
+          .split('\n')
+          .map((line) => line.trim())
+          .filter((line) => line.startsWith('data:'))
+          .map((line) => parse(line.slice(5).trim()));
+  return found.flat().filter((message) => message !== null && typeof message === 'object' && !Array.isArray(message));
+}
+
+// [x2] TE17 (D-209): the error for a reply that carried no response to the request (an `id: null` error,
+// a server's own `{ error }`, an SSE stream that ended first); `body` is the message that came instead, if any
+function noReply(what: string, status: number, body?: any): McpError {
+  const error = body?.error;
+  const detail = typeof error === 'string' ? error : typeof error?.message === 'string' ? error.message : '';
+  const code = typeof error?.code === 'number' ? error.code : ErrorCode.InternalError;
+  return new McpError(code, `${what} (HTTP ${status})` + (detail ? `: ${detail}` : ''), body);
+}
+
 export class McpClient {
   private proc?: child_process.ChildProcess;
   private requestId: number = 0;
@@ -581,6 +612,18 @@ export class McpClient {
         // each failure ends this call only, instead of an unhandled rejection that ends SillyTavern
         try {
           const contentType = res.headers.get('content-type') || '';
+          if (!res.ok) {
+            // [x2] TE17: a non-2xx reply ends the call with the JSON-RPC error for this id when the body has one,
+            // otherwise with the status code
+            const text = await res.text();
+            const own = parseMessages(text).find((message) => message.id === id && message.error);
+            fail(
+              own
+                ? new McpError(own.error.code, own.error.message, own.error.data)
+                : new McpError(ErrorCode.ConnectionClosed, `HTTP error: ${res.status} - ${text.slice(0, 500)}`),
+            );
+            return;
+          }
           if (contentType.includes('application/json')) {
             const text = await res.text();
             let message: any;
@@ -593,6 +636,9 @@ export class McpClient {
             if (message !== null && typeof message === 'object') {
               this.handleMessage(message);
             }
+            // [x2] TE17: a reply without this request's id (an `id: null` error, a server's own `{ error }`)
+            // fails the call instead of being dropped as a notification
+            fail(noReply(`No response to request ${id} in the reply`, res.status, message));
           } else if (contentType.includes('text/event-stream')) {
             // Parse SSE stream directly from POST response body
             const body = res.body;
@@ -601,6 +647,7 @@ export class McpClient {
               return;
             }
             let buffer = '';
+            let other: any; // [x2] TE17: the last error message for another id, for the failure below
             for await (const chunk of body as AsyncIterable<Buffer | string>) {
               const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : chunk;
               buffer += text;
@@ -611,6 +658,9 @@ export class McpClient {
                 if (trimmed.startsWith('data:')) {
                   try {
                     const json = JSON.parse(trimmed.slice(5).trim());
+                    if (json?.error && json.id !== id) {
+                      other = json;
+                    }
                     this.handleMessage(json);
                   } catch (e) {
                     console.error('Failed to parse SSE data:', e);
@@ -618,7 +668,8 @@ export class McpClient {
                 }
               }
             }
-            succeed(undefined);
+            // [x2] TE17: a stream that ends before this request's response fails the call (it resolved undefined)
+            fail(noReply(`SSE stream ended without a response to request ${id}`, res.status, other));
           } else {
             fail(new McpError(ErrorCode.ConnectionClosed, `Unexpected content-type: ${contentType}`));
           }
