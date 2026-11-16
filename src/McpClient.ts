@@ -521,7 +521,25 @@ export class McpClient {
             _meta: progressToken ? { progressToken } : undefined,
           },
         };
-        this.pendingRequests.set(id, { resolve, reject, method });
+        // [x2] TE17 (D-209): every way out of this request settles it once and removes it from pendingRequests
+        let settled = false;
+        const settle = () => {
+          settled = true;
+          this.pendingRequests.delete(id);
+        };
+        const succeed = (value: unknown) => {
+          if (!settled) {
+            settle();
+            resolve(value);
+          }
+        };
+        const fail = (error: unknown) => {
+          if (!settled) {
+            settle();
+            reject(error);
+          }
+        };
+        this.pendingRequests.set(id, { resolve: succeed, reject: fail, method });
         const headers: any = {
           'Content-Type': 'application/json',
           Accept: 'application/json, text/event-stream',
@@ -539,11 +557,12 @@ export class McpClient {
             body: JSON.stringify(request),
           });
         } catch (err) {
-          reject(new McpError(ErrorCode.ConnectionClosed, 'Network error: ' + (err as Error).message));
+          fail(new McpError(ErrorCode.ConnectionClosed, 'Network error: ' + (err as Error).message));
           return;
         }
         // Handle session expired (404) per spec
         if (res.status === 404 && this.sessionId) {
+          settle(); // [x2] TE17: this request ends here; the retry below is a new request
           // Session expired, clear and re-initialize
           this.sessionId = undefined;
           this.isConnected = false;
@@ -558,38 +577,53 @@ export class McpClient {
           return;
         }
 
-        const contentType = res.headers.get('content-type') || '';
-        if (contentType.includes('application/json')) {
-          const result: any = await res.json();
-          this.handleMessage(result);
-        } else if (contentType.includes('text/event-stream')) {
-          // Parse SSE stream directly from POST response body
-          const body = res.body;
-          if (!body || typeof body[Symbol.asyncIterator] !== 'function') {
-            reject(new McpError(ErrorCode.ConnectionClosed, 'No stream available for SSE response'));
-            return;
-          }
-          let buffer = '';
-          for await (const chunk of body as AsyncIterable<Buffer | string>) {
-            const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : chunk;
-            buffer += text;
-            let lines = buffer.split('\n');
-            buffer = lines.pop() || '';
-            for (const line of lines) {
-              const trimmed = line.trim();
-              if (trimmed.startsWith('data:')) {
-                try {
-                  const json = JSON.parse(trimmed.slice(5).trim());
-                  this.handleMessage(json);
-                } catch (e) {
-                  console.error('Failed to parse SSE data:', e);
+        // [x2] TE17: reading or parsing the body can fail (a body that is not JSON, a body cut mid-stream);
+        // each failure ends this call only, instead of an unhandled rejection that ends SillyTavern
+        try {
+          const contentType = res.headers.get('content-type') || '';
+          if (contentType.includes('application/json')) {
+            const text = await res.text();
+            let message: any;
+            try {
+              message = JSON.parse(text);
+            } catch (e) {
+              fail(new McpError(ErrorCode.ParseError, 'Invalid JSON response: ' + (e as Error).message));
+              return;
+            }
+            if (message !== null && typeof message === 'object') {
+              this.handleMessage(message);
+            }
+          } else if (contentType.includes('text/event-stream')) {
+            // Parse SSE stream directly from POST response body
+            const body = res.body;
+            if (!body || typeof body[Symbol.asyncIterator] !== 'function') {
+              fail(new McpError(ErrorCode.ConnectionClosed, 'No stream available for SSE response'));
+              return;
+            }
+            let buffer = '';
+            for await (const chunk of body as AsyncIterable<Buffer | string>) {
+              const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : chunk;
+              buffer += text;
+              let lines = buffer.split('\n');
+              buffer = lines.pop() || '';
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (trimmed.startsWith('data:')) {
+                  try {
+                    const json = JSON.parse(trimmed.slice(5).trim());
+                    this.handleMessage(json);
+                  } catch (e) {
+                    console.error('Failed to parse SSE data:', e);
+                  }
                 }
               }
             }
+            succeed(undefined);
+          } else {
+            fail(new McpError(ErrorCode.ConnectionClosed, `Unexpected content-type: ${contentType}`));
           }
-          resolve(undefined);
-        } else {
-          reject(new McpError(ErrorCode.ConnectionClosed, `Unexpected content-type: ${contentType}`));
+        } catch (err) {
+          fail(new McpError(ErrorCode.ConnectionClosed, 'Failed to read the response: ' + (err as Error).message));
         }
       });
     }
